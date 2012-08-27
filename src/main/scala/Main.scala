@@ -6,17 +6,41 @@ import org.jboss.netty.channel.Channels._
 import org.jboss.netty.channel._
 import org.jboss.netty.buffer._
 import org.jboss.netty.handler.codec.http._
-import org.jboss.netty.util._
+import org.jboss.netty.util.{ Timeout => _, _ }
 import java.net.InetSocketAddress
 import java.util.concurrent.Executors
 import scala.collection.JavaConverters._
 import scala.util.Properties
 
+import akka.actor._
+import akka.dispatch._
+import akka.util._
+import akka.util.duration._
+import akka.pattern.ask
+
+case object GetActorInfo
+
+class ToyActor extends Actor with ActorLogging {
+  var counter = 0
+
+  override def receive: Receive = {
+    case GetActorInfo =>
+      log.info("Received GetActorInfo message with counter=" + counter)
+      sender ! ("This is from actor " + self.path + " and is request " + counter)
+      counter += 1
+  }
+}
+
 object Main extends App {
   // Heroku gives us a port in the PORT environment variable
   val port = Integer.parseInt(Properties.envOrElse("PORT", "9000"))
-  println("Starting demo web server on port " + port)
-  val server = new DemoServer(port)
+
+  // create actor system and actor
+  val system = ActorSystem("demo")
+  val actor = system.actorOf(Props[ToyActor], name="Demo" + (new java.security.SecureRandom()).nextInt())
+
+  println("Starting demo web server on port " + port + " with actor " + actor)
+  val server = new DemoServer(port, actor)
   server.run()
 }
 
@@ -24,30 +48,30 @@ object Main extends App {
 // Everything below here is more about Netty than Heroku or Scala
 
 
-class DemoServer(val port: Int) {
+class DemoServer(val port: Int, val actor: ActorRef) {
   def run(): Unit = {
     val bootstrap = new ServerBootstrap(new NioServerSocketChannelFactory(
       Executors.newCachedThreadPool(),
       Executors.newCachedThreadPool()));
-    bootstrap.setPipelineFactory(new DemoPipelineFactory);
+    bootstrap.setPipelineFactory(new DemoPipelineFactory(actor));
     bootstrap.bind(new InetSocketAddress(port));
   }
 }
 
-class DemoPipelineFactory extends ChannelPipelineFactory {
+class DemoPipelineFactory(val actor: ActorRef) extends ChannelPipelineFactory {
   override def getPipeline(): ChannelPipeline = {
     val pipe = pipeline()
 
     pipe.addLast("decoder", new HttpRequestDecoder)
     pipe.addLast("encoder", new HttpResponseEncoder)
     pipe.addLast("deflater", new HttpContentCompressor)
-    pipe.addLast("handler", new DemoServerHandler)
+    pipe.addLast("handler", new DemoServerHandler(actor))
 
     pipe
   }
 }
 
-class DemoServerHandler extends SimpleChannelUpstreamHandler {
+class DemoServerHandler(val actor: ActorRef) extends SimpleChannelUpstreamHandler {
 
   var requestOption: Option[HttpRequest] = None
   var readingChunks = false
@@ -81,20 +105,17 @@ class DemoServerHandler extends SimpleChannelUpstreamHandler {
       buf.append("HELLO WORLD\r\n");
       buf.append("===================================\r\n");
 
-      for (entry <- request.getHeaders.asScala) {
-        buf.append("HEADER: " + entry.getKey + " = " + entry.getValue + "\r\n");
-      }
+      implicit val timeout = Timeout(2 seconds)
+
+      val blurb = Await.result(actor ? GetActorInfo, 1 second)
+
+      buf.append(blurb)
 
       buf.append("\r\n");
 
       if (request.isChunked()) {
         readingChunks = true;
       } else {
-        val content = request.getContent()
-        if (content.readable()) {
-          buf.append("CONTENT: " + content.toString(CharsetUtil.UTF_8) + "\r\n");
-        }
-
         writeResponse(e);
       }
     }
